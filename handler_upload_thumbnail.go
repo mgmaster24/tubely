@@ -1,11 +1,14 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
-	"time"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -35,7 +38,7 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	fmt.Println("uploading thumbnail for video", videoID, "by user", userID)
 
 	// TODO: implement the upload here
-	const maxMemory = 10 << 20
+	const maxMemory = 1 << 20
 	err = r.ParseMultipartForm(maxMemory)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Couldn't parse request", err)
@@ -51,11 +54,11 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	defer file.Close()
 
 	mediaType := fileHeader.Header.Get("Content-Type")
-	data, err := io.ReadAll(file)
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Failed to read file", err)
-		return
-	}
+	//data, err := io.ReadAll(file)
+	//if err != nil {
+	//	respondWithError(w, http.StatusBadRequest, "Failed to read file", err)
+	//	return
+	//}
 
 	vidMetadata, err := cfg.db.GetVideo(videoID)
 	if err != nil {
@@ -63,20 +66,44 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	*vidMetadata.ThumbnailURL = fmt.Sprintf(
-		"data:%s;base64, %s",
-		mediaType,
-		base64.StdEncoding.EncodeToString(data),
-	)
-	vidMetadata.UpdatedAt = time.Now()
-	fmt.Println(vidMetadata)
+	// Base64 encoding in Database
+	//thumbnailURL := fmt.Sprintf(
+	//	"data:%s;base64, %s",
+	//	mediaType,
+	//	base64.StdEncoding.EncodeToString(data),
+	//)
+
+	fileExt := strings.Split(mediaType, "/")[1]
+	randBytes := make([]byte, 32)
+	_, err = rand.Read(randBytes)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to save file", err)
+		return
+	}
+
+	randStr := base64.RawURLEncoding.EncodeToString(randBytes)
+	fileName := fmt.Sprintf("%s.%s", randStr, fileExt)
+	filePath := filepath.Join(cfg.assetsRoot, fileName)
+	f, err := os.Create(filePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to save file", err)
+		return
+	}
+
+	defer f.Close()
+	_, err = io.Copy(f, file)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to save file", err)
+		return
+	}
+
+	thumbnailURL := fmt.Sprintf("http://localhost:%s/assets/%s", cfg.port, fileName)
+	vidMetadata.ThumbnailURL = &thumbnailURL
 	err = cfg.db.UpdateVideo(vidMetadata)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to update video", err)
 		return
 	}
-
-	fmt.Println(vidMetadata)
 
 	respondWithJSON(w, http.StatusOK, vidMetadata)
 }
