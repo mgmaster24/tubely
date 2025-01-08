@@ -1,13 +1,12 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
@@ -85,7 +84,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	defer os.Remove(f.Name())
 	defer f.Close()
 
-	length, err := io.Copy(f, file)
+	_, err = io.Copy(f, file)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to save file", err)
 		return
@@ -102,30 +101,65 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	randBytes := make([]byte, 32)
-	_, err = rand.Read(randBytes)
+	processedFile, err := processVideoForFastStart(f.Name())
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to create key", err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to process video", err)
 		return
 	}
 
-	key := fmt.Sprintf("%s.mp4", base64.RawURLEncoding.EncodeToString(randBytes))
-	cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
+	ratio, err := getVideoAspectRatio(processedFile)
+	aspect := ""
+	switch ratio {
+	case "16:9":
+		aspect = "landscape"
+	case "9:16":
+		aspect = "portrait"
+	default:
+		aspect = "other"
+	}
+
+	fastStartF, err := os.Open(processedFile)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to open processed video", err)
+		return
+	}
+
+	defer fastStartF.Close()
+
+	fi, err := fastStartF.Stat()
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to get file indo", err)
+		return
+	}
+
+	key := filepath.Join(aspect, getAssetsPath(mediaType))
+	length := fi.Size()
+	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:        &cfg.s3Bucket,
-		Body:          f,
+		Body:          fastStartF,
 		Key:           &key,
 		ContentType:   &mediaType,
 		ContentLength: &length,
 	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to upload video to S3", err)
+		return
+	}
 
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, key)
+	videoURL := fmt.Sprintf("%s,%s", cfg.s3Bucket, key)
 	vidMetadata.VideoURL = &videoURL
+
 	err = cfg.db.UpdateVideo(vidMetadata)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to update video", err)
 		return
 	}
 
-	fmt.Println("uploading video", videoID, "by user", userID)
+	vidMetadata, err = cfg.dbVideoToSignedVideo(vidMetadata)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to presign video URL", err)
+		return
+	}
+
 	respondWithJSON(w, http.StatusOK, vidMetadata)
 }
